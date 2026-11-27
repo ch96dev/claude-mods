@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type { Limit, Reading } from '../types'
 
@@ -11,6 +11,7 @@ const LABELS: Record<string, string> = {
 }
 
 const BAR = 12
+const POLL_MS = 30_000
 
 function bar(percent: number): string {
   const filled = Math.max(0, Math.min(BAR, Math.round((percent / 100) * BAR)))
@@ -39,26 +40,87 @@ function copy(limits: readonly Limit[]): Limit[] {
   return limits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt }))
 }
 
+// --- Shared file: every session of this plugin reads and writes the same one.
+
+let sharedPath: string | undefined
+
+async function shared($: EngineInterface): Promise<string> {
+  if (!sharedPath) {
+    const env = await $.process.hookEnv()
+    sharedPath = `${env.CLAUDE_PLUGIN_DATA}/latest.json`
+  }
+  return sharedPath
+}
+
+function parse(text: string): Reading | null {
+  try {
+    const v = JSON.parse(text) as { limits?: unknown; at?: unknown }
+    if (!Array.isArray(v.limits) || typeof v.at !== 'number') return null
+    const limits = v.limits
+      .filter(
+        (l): l is Limit =>
+          typeof l === 'object' && l !== null && typeof l.kind === 'string' && typeof l.percentUsed === 'number',
+      )
+      .map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: typeof l.resetsAt === 'string' ? l.resetsAt : undefined }))
+    return { limits, at: v.at }
+  } catch {
+    return null
+  }
+}
+
+async function readShared($: EngineInterface): Promise<Reading | null> {
+  try {
+    return parse(await $.fs.read(await shared($)))
+  } catch {
+    return null // no file yet, or unreadable
+  }
+}
+
+// A fresh reading from this session's own API response: keep it and share it
+// unless the file already holds a newer one.
+async function publish($: EngineInterface, fresh: Reading): Promise<void> {
+  await update($, reading, cur => (cur && cur.at > fresh.at ? cur : fresh))
+  try {
+    const onDisk = await readShared($)
+    if (!onDisk || onDisk.at < fresh.at) {
+      await $.fs.write(await shared($), JSON.stringify({ limits: fresh.limits, at: fresh.at }))
+    }
+  } catch {
+    // Sharing is best effort; this session still shows its own reading.
+  }
+}
+
+// Take the file's reading when it is newer than ours; touch `checkedAt` either
+// way so the reset countdown redraws.
+async function pull($: EngineInterface): Promise<void> {
+  const onDisk = await readShared($)
+  const now = await $.clock.now()
+  await update($, reading, cur => {
+    const best = onDisk && (!cur || onDisk.at > cur.at) ? onDisk : cur
+    return best ? { ...best, checkedAt: now } : null
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    const { rateLimits } = await $.session.usage()
-    const first: Reading = { limits: copy(rateLimits), at: await $.clock.now() }
-    await update($, reading, () => first)
+    // Start from whatever another session last shared.
+    await pull($)
 
-    // Refresh every minute so the reset countdown stays current.
-    $.clock.every(60_000, async () => {
-      const usage = await $.session.usage()
-      const fresh: Reading = { limits: copy(usage.rateLimits), at: await $.clock.now() }
-      await update($, reading, () => fresh)
-    })
+    const { rateLimits } = await $.session.usage()
+    const cur = await read($, reading)
+    if (rateLimits.length > 0 && !cur) {
+      await update($, reading, () => ({ limits: copy(rateLimits), at: 0 }))
+    }
+
+    $.clock.every(POLL_MS, () => pull($))
 
     return next(e)
   })
 
+  // Fires after each turn with the limits the last response reported: fresh.
   on('session.measure', async ($, e, next) => {
     if (e.rateLimits.length > 0) {
-      const fresh: Reading = { limits: copy(e.rateLimits), at: await $.clock.now() }
-      await update($, reading, () => fresh)
+      await publish($, { limits: copy(e.rateLimits), at: await $.clock.now() })
     }
     return next(e)
   })
