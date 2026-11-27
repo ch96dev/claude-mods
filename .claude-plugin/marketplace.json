@@ -1,0 +1,12 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "ch96dev" },
+  "description": "Claude Code용 mod 모음",
+  "plugins": [
+    {
+      "name": "usage-band",
+      "source": "./usage-band",
+      "description": "Shows the 5-hour and weekly usage limits in a band above the prompt"
+    }
+  ]
+}
